@@ -1,0 +1,139 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Verify formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The unit tests are hermetic; this confirms the binary actually runs a
+      # scan end to end on a real network without crashing or hanging.
+      - name: Smoke test
+        if: matrix.os != 'windows-latest'
+        run: |
+          go run ./cmd/midwatch version
+          go run ./cmd/midwatch scan --json --timeout 10s --fail-on never > /tmp/midwatch.json
+          test -s /tmp/midwatch.json
+          python3 -c "
+          import json
+          r = json.load(open('/tmp/midwatch.json'))
+          got = [m['id'] for m in r['modules']]
+          want = ['tls', 'dns', 'http', 'egress', 'comms', 'time']
+          assert got == want, f'modules {got}, want {want}'
+          print('modules:', got)
+          print('verdict:', r['verdict'])"
+
+  # A dependency-free tool should stay that way. This fails the build if
+  # anything is ever added to go.mod.
+  no-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Assert the module has no third-party requirements
+        run: |
+          if grep -qE '^\s*require' go.mod; then
+            echo "go.mod gained a dependency; midwatch is intentionally stdlib-only."
+            grep -A100 'require' go.mod
+            exit 1
+          fi
+          test ! -f go.sum || { echo "go.sum should not exist"; exit 1; }
+
+  # Zero dependencies is not zero exposure: crypto/tls, crypto/x509 and
+  # net/http all ship security fixes, and reasoning about what they hand back
+  # is the entire job here.
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # Every source file must carry the MPL notice, or the file-level copyleft
+  # has nothing to attach to.
+  license-headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert every Go file carries the MPL header
+        run: |
+          missing=$(for f in $(find ./cmd ./internal -name '*.go'); do
+            head -3 "$f" | grep -q 'Mozilla Public' || echo "$f"
+          done)
+          if [ -n "$missing" ]; then
+            echo "These files are missing the MPL-2.0 header:"
+            echo "$missing"
+            exit 1
+          fi
+
+  # Every commit needs a Signed-off-by line. Keeping provenance clean is part
+  # of the product for a tool people run to decide what to trust.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check sign-off on every commit in this PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            if ! git show -s --format=%B "$sha" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "missing Signed-off-by: $(git show -s --format='%h %s' "$sha")"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo
+            echo "Sign off with 'git commit -s', or fix existing commits with:"
+            echo "  git rebase --signoff $BASE_SHA"
+            exit 1
+          fi
+          echo "all commits signed off"

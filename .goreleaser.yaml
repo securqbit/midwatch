@@ -1,0 +1,110 @@
+version: 2
+
+project_name: midwatch
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: midwatch
+    main: ./cmd/midwatch
+    binary: midwatch
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/securqbit/midwatch/internal/version.Version={{ .Version }}
+      - -X github.com/securqbit/midwatch/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/securqbit/midwatch/internal/version.Date={{ .Date }}
+    goos: [linux, darwin, windows, freebsd]
+    goarch: [amd64, arm64, arm]
+    goarm: ["7"]
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      # MPL-2.0 §3.5 reserves the marks, so the policy travels with the code.
+      - TRADEMARK.md
+      # Keeps the CLI reference the README links to available offline.
+      - docs/cli.md
+
+checksum:
+  name_template: checksums.txt
+
+# Keyless signing through the Sigstore public good instance. There is no
+# private key to protect or rotate; the signature binds the artifacts to the
+# GitHub Actions workflow that produced them, and the certificate is recorded
+# in the public Rekor transparency log.
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: New checks and detections
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes and false positives
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 99
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  footer: |
+    ## Verify your download
+
+    Check the archive against the checksum list:
+
+    ```sh
+    sha256sum -c checksums.txt --ignore-missing
+    ```
+
+    Then verify that the checksum list itself came from our release workflow
+    and not from whoever served you the file:
+
+    ```sh
+    cosign verify-blob checksums.txt \
+      --signature checksums.txt.sig \
+      --certificate checksums.txt.pem \
+      --certificate-identity-regexp '^https://github\.com/securqbit/midwatch/\.github/workflows/release\.yml@refs/tags/' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    ```
+
+    Run `midwatch scan` on the network you want to audit. Nothing is uploaded
+    anywhere; the report is printed locally.

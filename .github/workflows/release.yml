@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload artifacts
+      id-token: write # keyless signing via the Sigstore public good instance
+      attestations: write # build provenance attestations
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Signs checksums.txt keylessly: no long-lived key to leak, and the
+      # signing identity is this workflow in this repository, publicly logged
+      # in Rekor. For a tool people run to decide whether to trust a network,
+      # "the binary is what we built" needs to be checkable without trusting
+      # the same GitHub that serves it.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz,dist/*.zip,dist/checksums.txt"
