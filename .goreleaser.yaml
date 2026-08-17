@@ -70,6 +70,11 @@ snapshot:
 changelog:
   sort: asc
   use: github
+  # GoReleaser's default entry format appends the commit author, falling back
+  # to "Name <email>" whenever the commit email is not linked to a GitHub
+  # account. Release notes are not the place to publish an address, so the
+  # entry is the subject line and nothing else.
+  format: "{{ .Message }}"
   groups:
     - title: New checks and detections
       regexp: '^.*?feat(\(.+\))??!?:.+$'
