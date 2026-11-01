@@ -110,3 +110,69 @@ func TestCompactErrIsReadable(t *testing.T) {
 type errTest string
 
 func (e errTest) Error() string { return string(e) }
+
+// stunWithAttribute wraps one raw attribute in a binding success response,
+// with no padding added, so malformed shapes can be fed to the parser.
+func stunWithAttribute(txID []byte, typ uint16, value []byte) []byte {
+	attr := make([]byte, 4)
+	binary.BigEndian.PutUint16(attr[0:2], typ)
+	binary.BigEndian.PutUint16(attr[2:4], uint16(len(value)))
+	attr = append(attr, value...)
+
+	msg := make([]byte, 20)
+	binary.BigEndian.PutUint16(msg[0:2], 0x0101)
+	binary.BigEndian.PutUint16(msg[2:4], uint16(len(attr)))
+	binary.BigEndian.PutUint32(msg[4:8], stunMagicCookie)
+	copy(msg[8:20], txID)
+	return append(msg, attr...)
+}
+
+// A reply is attacker-controlled input: anything on the path can answer a
+// UDP request. None of these may panic, because a panic here ends the scan.
+func TestParseSTUNResponseSurvivesMalformedAttributes(t *testing.T) {
+	txID := []byte("0123456789ab")
+	cases := map[string][]byte{
+		// Longer than the 16-byte cookie-plus-transaction-id XOR mask.
+		"oversized ipv6 xor-mapped": append([]byte{0, 0x02, 0, 0}, make([]byte, 24)...),
+		"oversized ipv4 xor-mapped": append([]byte{0, 0x01, 0, 0}, make([]byte, 40)...),
+		"ipv6 family, ipv4 length":  {0, 0x02, 0, 0, 1, 2, 3, 4},
+		"unknown family":            {0, 0x07, 0, 0, 1, 2, 3, 4},
+		// Five bytes with no padding: the advance overruns the message.
+		"unpadded final attribute": {0, 0x07, 0, 0, 1},
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parseSTUNResponse panicked: %v", r)
+				}
+			}()
+			msg := stunWithAttribute(txID, 0x0020, value)
+			addr, err := parseSTUNResponse(msg, txID)
+			// An oversized attribute still carries a usable address in its
+			// leading bytes; everything else must be rejected.
+			if err == nil && addr == nil {
+				t.Error("nil address without an error")
+			}
+		})
+	}
+}
+
+func TestParseSTUNResponseSkipsBadAttributeForGoodOne(t *testing.T) {
+	txID := []byte("0123456789ab")
+	good := buildSTUNSuccess(txID, net.IPv4(203, 0, 113, 45), 1234)
+	goodAttr := good[20:]
+
+	// A malformed attribute first, then the real mapping.
+	bad := []byte{0x00, 0x20, 0x00, 0x08, 0, 0x07, 0, 0, 1, 2, 3, 4}
+	msg := append(append([]byte{}, good[:20]...), append(bad, goodAttr...)...)
+	binary.BigEndian.PutUint16(msg[2:4], uint16(len(msg)-20))
+
+	addr, err := parseSTUNResponse(msg, txID)
+	if err != nil {
+		t.Fatalf("parseSTUNResponse: %v", err)
+	}
+	if !addr.IP.Equal(net.IPv4(203, 0, 113, 45)) || addr.Port != 1234 {
+		t.Errorf("got %v, want 203.0.113.45:1234", addr)
+	}
+}

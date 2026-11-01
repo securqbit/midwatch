@@ -374,30 +374,40 @@ func parseSTUNResponse(buf, txID []byte) (*net.UDPAddr, error) {
 			xorred := typ == 0x0020
 			family := value[1]
 			portBytes := binary.BigEndian.Uint16(value[2:4])
-			ipBytes := append([]byte{}, value[4:]...)
-			if xorred {
-				portBytes ^= uint16(stunMagicCookie >> 16)
-				cookie := make([]byte, 4)
-				binary.BigEndian.PutUint32(cookie, stunMagicCookie)
-				for i := range ipBytes {
-					if i < 4 {
-						ipBytes[i] ^= cookie[i]
-					} else {
-						ipBytes[i] ^= txID[i-4]
+			// Take exactly the address the family calls for. The XOR mask is
+			// the four-byte cookie plus the twelve-byte transaction id, so a
+			// longer attribute — from a broken server, or anything on the path
+			// willing to answer UDP — would index past the transaction id and
+			// take the whole scan down with it. An attribute that does not fit
+			// is skipped like any other unusable one, so a well-formed mapping
+			// later in the same reply is still found.
+			addrLen := map[byte]int{0x01: 4, 0x02: 16}[family]
+			if addrLen > 0 && len(value) >= 4+addrLen {
+				ipBytes := append([]byte{}, value[4:4+addrLen]...)
+				if xorred {
+					portBytes ^= uint16(stunMagicCookie >> 16)
+					cookie := make([]byte, 4)
+					binary.BigEndian.PutUint32(cookie, stunMagicCookie)
+					for i := range ipBytes {
+						if i < 4 {
+							ipBytes[i] ^= cookie[i]
+						} else {
+							ipBytes[i] ^= txID[i-4]
+						}
 					}
 				}
-			}
-			switch {
-			case family == 0x01 && len(ipBytes) >= 4:
-				return &net.UDPAddr{IP: net.IP(ipBytes[:4]), Port: int(portBytes)}, nil
-			case family == 0x02 && len(ipBytes) >= 16:
-				return &net.UDPAddr{IP: net.IP(ipBytes[:16]), Port: int(portBytes)}, nil
+				return &net.UDPAddr{IP: net.IP(ipBytes), Port: int(portBytes)}, nil
 			}
 		}
 		// Attributes are padded to a four byte boundary.
 		advance := 4 + length
 		if pad := advance % 4; pad != 0 {
 			advance += 4 - pad
+		}
+		// A final attribute sent without its padding would otherwise slice
+		// past the end of the message.
+		if advance >= len(body) {
+			break
 		}
 		body = body[advance:]
 	}
